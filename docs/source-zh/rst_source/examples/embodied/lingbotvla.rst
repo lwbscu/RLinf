@@ -295,3 +295,5 @@ GRPO 顶层文件通过 Hydra 动态组装了环境与模型，并直接在 ``ac
    :align: center
 
    GRPO 在 RoboTwin Click Bell 任务上提升 ``env/success_once``。
+
+Lingbot-VLA RoboTwin RL 权重：`RLinf/RLinf-lingbotvla-click-bell-grpo <https://huggingface.co/RLinf/RLinf-lingbotvla-click-bell-grpo>`__。

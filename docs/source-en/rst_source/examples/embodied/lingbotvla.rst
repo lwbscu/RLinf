@@ -295,3 +295,5 @@ logged metric, see :doc:`Training metrics <../../reference/metrics>`.
    :align: center
 
    GRPO lifts ``env/success_once`` on the RoboTwin Click Bell task.
+
+Lingbot-VLA RoboTwin RL checkpoint: `RLinf/RLinf-lingbotvla-click-bell-grpo <https://huggingface.co/RLinf/RLinf-lingbotvla-click-bell-grpo>`__.

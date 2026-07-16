@@ -20,7 +20,7 @@ import random
 import sys
 from contextlib import contextmanager
 from functools import partial, wraps
-from typing import Any, Callable, Literal, Optional
+from typing import Any, Callable, Iterable, Literal, Optional
 
 import numpy as np
 import torch
@@ -28,12 +28,11 @@ import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 
+from rlinf.scheduler import Worker
 from rlinf.utils.metric_utils import compute_loss_mask
 
 
 def clear_memory(sync=True):
-    from rlinf.scheduler.worker.worker import Worker
-
     if sync:
         Worker.torch_platform.synchronize()
     gc.collect()
@@ -64,30 +63,55 @@ def materialize_tensor(tensor: torch.Tensor | DTensor) -> torch.Tensor:
     return tensor
 
 
-def normalize_dtype(dtype: torch.dtype | str) -> torch.dtype:
+_TORCH_STR_DTYPE_MAPPING = {
+    "float32": torch.float32,
+    "fp32": torch.float32,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+}
+
+_TORCH_DTYPE_SIZE_MAPPING = {
+    torch.bool: 1,
+    torch.uint8: 1,
+    torch.int8: 1,
+    torch.int16: 2,
+    torch.int32: 4,
+    torch.int64: 8,
+    torch.float16: 2,
+    torch.bfloat16: 2,
+    torch.float32: 4,
+    torch.float64: 8,
+    torch.complex64: 8,
+    torch.complex128: 16,
+}
+
+
+def dtype_size(dtype: torch.dtype | str) -> int:
+    """Return the size in bytes of a given torch.dtype."""
+    dtype = normalize_dtype(dtype)
+    if dtype not in _TORCH_DTYPE_SIZE_MAPPING:
+        return torch.empty((), dtype=dtype).element_size()
+    return _TORCH_DTYPE_SIZE_MAPPING[dtype]
+
+
+def normalize_dtype(dtype: torch.dtype | str | None) -> torch.dtype | None:
     """Normalize string dtype aliases into torch.dtype values."""
+    if dtype is None:
+        return None
     if isinstance(dtype, torch.dtype):
         return dtype
     if isinstance(dtype, str):
-        mapping = {
-            "float32": torch.float32,
-            "fp32": torch.float32,
-            "float16": torch.float16,
-            "fp16": torch.float16,
-            "bfloat16": torch.bfloat16,
-            "bf16": torch.bfloat16,
-        }
         key = dtype.lower()
-        if key in mapping:
-            return mapping[key]
+        if key in _TORCH_STR_DTYPE_MAPPING:
+            return _TORCH_STR_DTYPE_MAPPING[key]
     raise TypeError(f"Unsupported dtype: {dtype}")
 
 
 def normalize_device(device: torch.device | str | None) -> torch.device:
     """Convert a device string into torch.device, defaulting to the worker device."""
     if device is None:
-        from rlinf.scheduler.worker.worker import Worker
-
         device = Worker.torch_device_type
     return device if isinstance(device, torch.device) else torch.device(device)
 
@@ -118,21 +142,42 @@ def collect_param_names_need_sync(module: torch.nn.Module) -> list[str]:
     return trainable_param_names + persistent_buffer_names
 
 
-def synchronize_pending_accel_copies(copy_devices: set[torch.device]) -> None:
-    """Wait for queued accelerator copies before host-side consumption."""
-    if not copy_devices:
-        return
+def tensors_record_stream(
+    tensors: Iterable[torch.Tensor], stream: torch.Stream | None = None
+) -> list[torch.Tensor]:
+    """
+    Record a stream for a collection of accelerator tensors.
 
-    events: list[torch.Event] = []
-    for device in copy_devices:
-        from rlinf.scheduler.worker.worker import Worker
+    In some cases, the backend may not support record_stream,
+    in which case we keep a reference to the tensors in a list to prevent the tensor storage
+    from being freed prematurely and allocated again by pytorch caching allocator.
+    The caller should synchronize before clearing these tensors.
 
-        event = Worker.torch_platform.Event()
-        event.record(Worker.torch_platform.current_stream(device))
-        events.append(event)
+    Args:
+        tensors (Iterable[torch.Tensor]): An iterable of tensors to record.
+        stream (torch.Stream | None): Stream to record for every tensor. When
+            unset, each tensor records the current stream for its own device.
 
-    for event in events:
-        event.synchronize()
+    Returns:
+        list[torch.Tensor]: A list of tensors that failed to record the stream,
+            which should be kept alive until synchronization.
+    """
+    if not Worker.torch_platform.is_initialized():
+        raise RuntimeError("Torch platform is not initialized, cannot record stream.")
+    fallback_keepalive: list[torch.Tensor] = []
+    for tensor in tensors:
+        if tensor.device.type != Worker.torch_device_type:
+            raise RuntimeError(
+                "Tensor device type does not match the worker device type, cannot record stream."
+            )
+        try:
+            record_stream = stream or Worker.torch_platform.current_stream(
+                tensor.device
+            )
+            tensor.record_stream(record_stream)
+        except (AttributeError, RuntimeError, TypeError):
+            fallback_keepalive.append(tensor)
+    return fallback_keepalive
 
 
 def seed_everything(seed: int) -> int:
@@ -625,48 +670,6 @@ def set_rng_state(rng_state: dict) -> None:
 
     if Worker.torch_platform.is_available() and Worker.torch_device_type in rng_state:
         Worker.torch_platform.set_rng_state(rng_state[Worker.torch_device_type])
-
-
-def _build_channel_message(
-    send_rank: int,
-    batch_idx: int,
-    mode: str,
-    tag: str,
-) -> str:
-    """
-    Construct a channel message key that matches the expected communication schema.
-
-    Schema:
-        {send_rank}_{batch_idx}_{tag}
-
-    Args:
-        send_rank: Send worker rank.
-        batch_idx: Batch index within the worker.
-        mode: The message mode.
-        tag: Type of message (e.g., "train_obs", "rollout_results").
-
-    Returns:
-        A formatted channel message string.
-    """
-
-    return f"{send_rank}_{batch_idx}_{mode}_{tag}"
-
-
-def _split_channel_message(channel_message: str) -> tuple[int, int, str, str]:
-    """
-    This function is used to get the rollout worker and env worker communication without the rankmap,
-    To get the send_rank, batch_idx, tag from the communication.
-    channel_message: {send_rank}_{batch_idx}_{mode}_{tag}
-    This func split the channel_message into send_rank, batch_idx, mode, tag
-    Args:
-        channel_message: The batch index string.
-    Returns:
-        A tuple of send_rank, batch_idx, mode, tag.
-    """
-    send_rank, batch_idx, mode, tag = channel_message.split("_", 3)
-    send_rank = int(send_rank)
-    batch_idx = int(batch_idx)
-    return send_rank, batch_idx, mode, tag
 
 
 PIPELINE_BATCH_KEY_SEPARATOR = "::"

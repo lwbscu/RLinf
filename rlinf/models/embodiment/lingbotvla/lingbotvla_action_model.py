@@ -193,6 +193,14 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         qwen_config.n_action_steps = self.action_chunk
         qwen_config.max_action_dim = int(getattr(qwen_config, "max_action_dim", 75))
         qwen_config.max_state_dim = int(getattr(qwen_config, "max_state_dim", 75))
+        self.sft_action_loss_dim = int(
+            getattr(config, "sft_action_loss_dim", self.action_dim)
+        )
+        if not 0 < self.sft_action_loss_dim <= qwen_config.max_action_dim:
+            raise ValueError(
+                "LingbotVLA sft_action_loss_dim must be in the range "
+                f"[1, {qwen_config.max_action_dim}], got {self.sft_action_loss_dim}."
+            )
 
         self.vla_model = LingbotVlaPolicy(
             config=qwen_config, tokenizer_path=config.tokenizer_path, eval=True
@@ -1090,16 +1098,29 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         state = data["state"].to(dtype)
         actions = data["actions"].to(dtype)
 
-        total_loss, loss_vla, loss_depth, loss_dict, depth_preds = self.vla_model(
-            images=images,
-            img_masks=data["img_masks"],
-            state=state,
-            lang_tokens=data["lang_tokens"],
-            lang_masks=data["lang_masks"],
-            actions=actions,
-            use_ki=False,
-            norm_qkv=self.vla_model.model.config.norm_qkv,
-        )
+        policy_config = self.vla_model.config
+        model_config = self.vla_model.model.config
+        original_policy_action_dim = getattr(policy_config, "action_dim", None)
+        original_model_action_dim = getattr(model_config, "action_dim", None)
+
+        policy_config.action_dim = self.sft_action_loss_dim
+        model_config.action_dim = self.sft_action_loss_dim
+        try:
+            total_loss, loss_vla, loss_depth, loss_dict, depth_preds = self.vla_model(
+                images=images,
+                img_masks=data["img_masks"],
+                state=state,
+                lang_tokens=data["lang_tokens"],
+                lang_masks=data["lang_masks"],
+                actions=actions,
+                use_ki=False,
+                norm_qkv=self.vla_model.model.config.norm_qkv,
+            )
+        finally:
+            if original_policy_action_dim is not None:
+                policy_config.action_dim = original_policy_action_dim
+            if original_model_action_dim is not None:
+                model_config.action_dim = original_model_action_dim
         return {"loss": total_loss, "l1_loss": loss_vla, **loss_dict}
 
     def default_forward(

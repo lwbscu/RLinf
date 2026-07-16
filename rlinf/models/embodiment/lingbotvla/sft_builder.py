@@ -16,6 +16,7 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
+import torch
 from lerobot.configs.policies import PreTrainedConfig
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -25,6 +26,9 @@ def _import_lingbotvla_deps():
     try:
         from lingbotvla.data.vla_data.base_dataset import RobotwinDataset
         from lingbotvla.data.vla_data.transform import Normalizer
+        from lingbotvla.data.vla_data.transform import prepare_images
+        from lingbotvla.data.vla_data.transform import prepare_language
+        from lingbotvla.data.vla_data.transform import prepare_state
         from lingbotvla.models import build_processor
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
@@ -34,7 +38,50 @@ def _import_lingbotvla_deps():
             "`examples/sft/run_vla_sft.sh robotwin_sft_lingbotvla`."
         ) from exc
 
-    return RobotwinDataset, Normalizer, build_processor
+    return (
+        RobotwinDataset,
+        Normalizer,
+        build_processor,
+        prepare_images,
+        prepare_language,
+        prepare_state,
+    )
+
+
+ROBOTWIN_ENV_TO_REP_STATE_INDICES = list(range(6)) + list(range(7, 13)) + [6] + [13]
+ROBOTWIN_REP_PADDED_STATE_INDICES = (
+    list(range(12)) + list(range(73, 75)) + list(range(12, 14)) + list(range(14, 73))
+)
+
+
+def _select_last_dim(tensor, indices, name):
+    if tensor.shape[-1] <= max(indices):
+        raise ValueError(
+            f"LingbotVLA RobotWin SFT expects {name} to have at least "
+            f"{max(indices) + 1} dims, got {tensor.shape[-1]}."
+        )
+    index = torch.as_tensor(indices, device=tensor.device, dtype=torch.long)
+    return tensor.index_select(-1, index)
+
+
+def _robotwin_rep_action_for_model(action, max_action_dim):
+    if action.shape[-1] < 14:
+        raise ValueError(
+            "LingbotVLA RobotWin SFT expects normalized env action with at least "
+            f"14 dims, got {action.shape[-1]}."
+        )
+    if max_action_dim < 16:
+        raise ValueError(
+            "LingbotVLA RobotWin SFT requires max_action_dim >= 16 for "
+            f"robotwin_rep gripper targets, got {max_action_dim}."
+        )
+
+    model_action = action.new_zeros((*action.shape[:-1], max_action_dim))
+    model_action[..., :6] = action[..., :6]
+    model_action[..., 6:12] = action[..., 7:13]
+    model_action[..., 14] = action[..., 6]
+    model_action[..., 15] = action[..., 13]
+    return model_action
 
 
 @dataclass
@@ -62,11 +109,18 @@ def _get_robotwin_data_type(lingbotvla_cfg):
     return data_type
 
 
-def _build_robotwin_dataset_cls(base_cls, normalizer_cls):
+def _build_robotwin_dataset_cls(
+    base_cls,
+    normalizer_cls,
+    prepare_images,
+    prepare_language,
+    prepare_state,
+):
     class RobotwinDatasetWithRepNormalizer(base_cls):
         def __init__(self, *args, data_config=None, **kwargs):
             super().__init__(*args, data_config=data_config, **kwargs)
             data_type = getattr(data_config, "data_type", "robotwin_rep")
+            self.data_type = data_type
             self.normalizer = normalizer_cls(
                 norm_stats=self.norm_stats["norm_stats"],
                 from_file=True,
@@ -80,11 +134,88 @@ def _build_robotwin_dataset_cls(base_cls, normalizer_cls):
                 },
             )
 
+        def getdata(self, idx):
+            if self.data_type != "robotwin_rep":
+                return super().getdata(idx)
+
+            item = dict(self.dataset[idx])
+            task = self.dataset_meta.tasks[int(item["task_index"])]
+            assert task == item["task"]
+
+            item["observation.state"] = _select_last_dim(
+                item["observation.state"],
+                ROBOTWIN_ENV_TO_REP_STATE_INDICES,
+                "raw env state before robotwin_rep reorder",
+            )
+            normalized_item = self.normalizer.normalize(item)
+
+            base_image = (
+                normalized_item["observation.images.cam_high"] * 255
+            ).to(torch.uint8)
+            left_wrist_image = (
+                normalized_item["observation.images.cam_left_wrist"] * 255
+            ).to(torch.uint8)
+            right_wrist_image = (
+                normalized_item["observation.images.cam_right_wrist"] * 255
+            ).to(torch.uint8)
+
+            batch_dict = {
+                "image": {
+                    "base_0_rgb": base_image,
+                    "left_wrist_0_rgb": left_wrist_image,
+                    "right_wrist_0_rgb": right_wrist_image,
+                },
+                "state": normalized_item["observation.state"].to(torch.float32),
+                "action": normalized_item["action"].to(torch.float32),
+                "action_is_pad": normalized_item["action_is_pad"],
+                "prompt": [item["task"]],
+            }
+
+            state = prepare_state(self.config, batch_dict)
+            state = _select_last_dim(
+                state,
+                ROBOTWIN_REP_PADDED_STATE_INDICES,
+                "padded robotwin_rep state before model reorder",
+            )
+            lang_tokens, lang_masks = prepare_language(
+                self.config, self.tokenizer, batch_dict
+            )
+            actions = _robotwin_rep_action_for_model(
+                batch_dict["action"], int(self.config.max_action_dim)
+            )
+            images, img_masks, pil_images = prepare_images(
+                self.config,
+                self.image_processor,
+                batch_dict,
+                use_depth_align=self.use_depth_align,
+            )
+
+            batch_dict = {
+                "images": images,
+                "img_masks": img_masks,
+                "state": state,
+                "lang_tokens": lang_tokens,
+                "lang_masks": lang_masks,
+                "actions": actions,
+                "action_is_pad": batch_dict["action_is_pad"],
+            }
+            if self.use_depth_align:
+                batch_dict["pil_images"] = pil_images
+
+            return batch_dict
+
     return RobotwinDatasetWithRepNormalizer
 
 
 def build_lingbot_sft_dataloader(cfg, world_size, global_rank, data_paths):
-    base_dataset_cls, normalizer_cls, build_processor = _import_lingbotvla_deps()
+    (
+        base_dataset_cls,
+        normalizer_cls,
+        build_processor,
+        prepare_images,
+        prepare_language,
+        prepare_state,
+    ) = _import_lingbotvla_deps()
 
     lingbotvla_cfg = getattr(
         cfg.actor.model,
@@ -140,7 +271,13 @@ def build_lingbot_sft_dataloader(cfg, world_size, global_rank, data_paths):
     )
 
     repo_id = data_paths if isinstance(data_paths, str) else data_paths[0]
-    dataset_cls = _build_robotwin_dataset_cls(base_dataset_cls, normalizer_cls)
+    dataset_cls = _build_robotwin_dataset_cls(
+        base_dataset_cls,
+        normalizer_cls,
+        prepare_images,
+        prepare_language,
+        prepare_state,
+    )
     dataset = dataset_cls(
         repo_id=repo_id,
         config=dataset_qwen_config,

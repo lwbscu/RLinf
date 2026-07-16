@@ -13,7 +13,7 @@
   cluster:
     num_nodes: 1
     component_placement:
-      actor,env,rollout: 0-7 
+      actor: 0-7
 
   runner:
     task_type: sft
@@ -27,6 +27,13 @@
     max_steps: 30000
     val_check_interval: -1
     save_interval: 1000
+    post_save_eval:
+      enabled: False
+      command: null
+      fail_on_error: True
+      offload_actor: True
+      eval_log_dir: null
+      cwd: null
 
   data:
     train_data_paths: "/path/to/robotwin-data"
@@ -35,6 +42,7 @@
     group_name: "ActorGroup"
     training_backend: "fsdp"
     micro_batch_size: 1
+    eval_batch_size: 1
     global_batch_size: 8
     seed: 0
 
@@ -51,6 +59,9 @@
         train_expert_only: False # if you follow RoboTwin official training, should set False
       num_action_chunks: 50 # interface for the env
       action_dim: 14
+      sft_action_loss_dim: 16
+      max_action_dim: 75
+      max_state_dim: 75
       add_value_head: False
 
     optim:
@@ -60,7 +71,7 @@
       adam_eps: 1.0e-08
       weight_decay: 1e-4
       clip_grad: 1.0
-      total_training_steps: 30000
+      total_training_steps: ${runner.max_steps}
       lr_warmup_steps: 1000
       lr_scheduler: "cosine"
       num_cycles: 0.5

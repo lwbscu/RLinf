@@ -13,7 +13,7 @@ export DREAMZERO_PATH=${DREAMZERO_PATH:-"/path/to/DreamZero"}
 export PYTHONPATH=${DREAMZERO_PATH}:$PYTHONPATH
 
 if [ -z "$1" ]; then
-    CONFIG_NAME="maniskill_ppo_openvlaoft"
+    CONFIG_NAME="robotwin_sft_lingbotvla"
 else
     CONFIG_NAME=$1
 fi

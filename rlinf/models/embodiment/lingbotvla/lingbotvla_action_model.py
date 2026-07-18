@@ -69,6 +69,7 @@ ROBOTWIN_REP_PADDED_STATE_INDICES = (
 )
 ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES = list(range(6)) + [14] + list(range(6, 12)) + [15]
 DEFAULT_RL_TRAINABLE_SCOPE = "action_expert"
+DEFAULT_SFT_TRAINABLE_SCOPE = None
 PIL_BILINEAR = (
     Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
 )
@@ -103,10 +104,8 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
             "depth_align_embs",
             "value_head",
         ]
-        if (
-            getattr(self.config, "rl_trainable_scope", DEFAULT_RL_TRAINABLE_SCOPE)
-            == "action_expert"
-        ):
+        trainable_scope, _ = self._selected_trainable_scope()
+        if trainable_scope == "action_expert":
             no_split_names.extend(
                 [
                     "action_time_mlp_in",
@@ -284,7 +283,7 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
                 "action": norm_type,
             },
         )
-        self._apply_rl_trainable_scope()
+        self._apply_trainable_scope()
 
     def _load_training_config(self, config_path: str, model_path: Optional[str]):
         candidate_paths = [os.path.join(config_path, "lingbotvla_cli.yaml")]
@@ -338,11 +337,20 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         policy_config.vision_config = qwen_config.vision_config
         return policy_config
 
+    def _selected_trainable_scope(self):
+        sft_trainable_scope = getattr(
+            self.config, "sft_trainable_scope", DEFAULT_SFT_TRAINABLE_SCOPE
+        )
+        if sft_trainable_scope is not None:
+            return sft_trainable_scope, "sft_trainable_scope"
+        return (
+            getattr(self.config, "rl_trainable_scope", DEFAULT_RL_TRAINABLE_SCOPE),
+            "rl_trainable_scope",
+        )
+
     def _mark_action_expert_fsdp_wrap_names(self):
-        if (
-            getattr(self.config, "rl_trainable_scope", DEFAULT_RL_TRAINABLE_SCOPE)
-            != "action_expert"
-        ):
+        trainable_scope, _ = self._selected_trainable_scope()
+        if trainable_scope != "action_expert":
             return
         qwen_expert_norm = getattr(
             self.vla_model.model.qwenvl_with_expert.qwen_expert.model,
@@ -352,17 +360,15 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         if qwen_expert_norm is not None:
             qwen_expert_norm._fsdp_wrap_name = "qwen_expert_norm"
 
-    def _apply_rl_trainable_scope(self):
-        trainable_scope = getattr(
-            self.config, "rl_trainable_scope", DEFAULT_RL_TRAINABLE_SCOPE
-        )
+    def _apply_trainable_scope(self):
+        trainable_scope, scope_name = self._selected_trainable_scope()
         if trainable_scope in (None, "all"):
-            self._log_trainable_scope("all")
+            self._log_trainable_scope(scope_name, "all")
             return
 
         if trainable_scope != "action_expert":
             raise ValueError(
-                "Unsupported LingbotVLA rl_trainable_scope: "
+                f"Unsupported LingbotVLA {scope_name}: "
                 f"{trainable_scope}. Expected one of: all, action_expert."
             )
 
@@ -387,15 +393,16 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
             for param in self.noise_head.parameters():
                 param.requires_grad = True
 
-        self._log_trainable_scope(trainable_scope)
+        self._log_trainable_scope(scope_name, trainable_scope)
 
-    def _log_trainable_scope(self, trainable_scope: str):
+    def _log_trainable_scope(self, scope_name: str, trainable_scope: str):
         trainable_params = sum(
             param.numel() for param in self.parameters() if param.requires_grad
         )
         total_params = sum(param.numel() for param in self.parameters())
         self.logger.info(
-            "LingbotVLA rl_trainable_scope=%s trainable_params=%d total_params=%d",
+            "LingbotVLA %s=%s trainable_params=%d total_params=%d",
+            scope_name,
             trainable_scope,
             trainable_params,
             total_params,

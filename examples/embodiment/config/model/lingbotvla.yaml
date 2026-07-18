@@ -20,7 +20,9 @@ proprio_dim: 14
 num_steps: 10
 add_value_head: False
 value_type: "action_level"
-rl_trainable_scope: "action_expert"  # Set to "all" to fine-tune the full LingbotVLA model.
+# Important: this is the RL/GRPO trainable-scope knob.
+# Keep "action_expert" as the default unless you intentionally full-finetune during RL.
+rl_trainable_scope: "action_expert"
 
 # Lingbotvla specific parameters 
 lingbotvla:

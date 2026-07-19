@@ -177,7 +177,13 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
                 ),
             )
         )
-        self.action_env_dim = int(getattr(config, "action_env_dim", self.action_dim))
+        self.action_env_dim = int(
+            getattr(
+                config,
+                "action_env_dim",
+                getattr(lingbotvla_cfg, "action_env_dim", self.action_dim),
+            )
+        )
         if not 0 < self.action_env_dim <= len(ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES):
             raise ValueError(
                 "LingbotVLA action_env_dim must be in the range "

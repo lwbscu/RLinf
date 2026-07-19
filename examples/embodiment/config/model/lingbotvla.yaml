@@ -9,6 +9,7 @@ precision: "bf16"
 # Action and chunk settings
 num_action_chunks: 50
 action_dim: 14
+action_env_dim: 14
 
 # LoRA settings
 is_lora: False

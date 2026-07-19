@@ -25,10 +25,12 @@ from torch.utils.data.distributed import DistributedSampler
 def _import_lingbotvla_deps():
     try:
         from lingbotvla.data.vla_data.base_dataset import RobotwinDataset
-        from lingbotvla.data.vla_data.transform import Normalizer
-        from lingbotvla.data.vla_data.transform import prepare_images
-        from lingbotvla.data.vla_data.transform import prepare_language
-        from lingbotvla.data.vla_data.transform import prepare_state
+        from lingbotvla.data.vla_data.transform import (
+            Normalizer,
+            prepare_images,
+            prepare_language,
+            prepare_state,
+        )
         from lingbotvla.models import build_processor
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
@@ -149,9 +151,9 @@ def _build_robotwin_dataset_cls(
             )
             normalized_item = self.normalizer.normalize(item)
 
-            base_image = (
-                normalized_item["observation.images.cam_high"] * 255
-            ).to(torch.uint8)
+            base_image = (normalized_item["observation.images.cam_high"] * 255).to(
+                torch.uint8
+            )
             left_wrist_image = (
                 normalized_item["observation.images.cam_left_wrist"] * 255
             ).to(torch.uint8)

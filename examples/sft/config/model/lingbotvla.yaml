@@ -23,8 +23,6 @@ proprio_dim: 14
 num_steps: 10
 add_value_head: False
 value_type: "action_level"
-# Important: this is the SFT trainable-scope knob.
-# Official-like RobotWin SFT should use "all"; do not change the RL knob for SFT.
 sft_trainable_scope: "all"
 
 # Lingbotvla specific parameters 

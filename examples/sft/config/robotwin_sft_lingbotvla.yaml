@@ -57,8 +57,6 @@
         stats_path: "${oc.env:LINGBOT_VLA_PATH}/assets/norm_stats/robotwin_all_new.json"
         data_type: "robotwin_rep"
         train_expert_only: False # if you follow RoboTwin official training, should set False
-      # Important: official-like RobotWin SFT trains the full LingbotVLA model.
-      # Do not set rl_trainable_scope in SFT configs; RL/GRPO owns that knob.
       sft_trainable_scope: "all"
       num_action_chunks: 50 # interface for the env
       action_dim: 14

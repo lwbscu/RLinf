@@ -40,6 +40,13 @@ from torch.utils._pytree import tree_map
 from transformers import AutoConfig
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.lingbotvla.robotwin_rep import (
+    ROBOTWIN_MODEL_ACTION_TO_ENV_INDICES,
+    robotwin_env_state_to_rep,
+    robotwin_model_action_to_env,
+    robotwin_normalizer_types,
+    robotwin_rep_state_to_model,
+)
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.logging import get_logger
@@ -63,13 +70,7 @@ class Observation:
         )
 
 
-ROBOTWIN_ENV_TO_REP_STATE_INDICES = list(range(6)) + list(range(7, 13)) + [6] + [13]
-ROBOTWIN_REP_PADDED_STATE_INDICES = (
-    list(range(12)) + list(range(73, 75)) + list(range(12, 14)) + list(range(14, 73))
-)
-ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES = list(range(6)) + [14] + list(range(6, 12)) + [15]
 DEFAULT_RL_TRAINABLE_SCOPE = "action_expert"
-DEFAULT_SFT_TRAINABLE_SCOPE = None
 PIL_BILINEAR = (
     Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
 )
@@ -184,10 +185,10 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
                 getattr(lingbotvla_cfg, "action_env_dim", self.action_dim),
             )
         )
-        if not 0 < self.action_env_dim <= len(ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES):
+        if not 0 < self.action_env_dim <= len(ROBOTWIN_MODEL_ACTION_TO_ENV_INDICES):
             raise ValueError(
                 "LingbotVLA action_env_dim must be in the range "
-                f"[1, {len(ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES)}] for RoboTwin "
+                f"[1, {len(ROBOTWIN_MODEL_ACTION_TO_ENV_INDICES)}] for RoboTwin "
                 f"SFT action reorder, got {self.action_env_dim}."
             )
         self.num_steps = int(getattr(config, "num_steps", 10))
@@ -281,13 +282,7 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
             norm_stats=self.norm_stats,
             from_file=True,
             data_type="robotwin_rep",
-            norm_type={
-                "observation.images.cam_high": "identity",
-                "observation.images.cam_left_wrist": "identity",
-                "observation.images.cam_right_wrist": "identity",
-                "observation.state": norm_type,
-                "action": norm_type,
-            },
+            norm_type=robotwin_normalizer_types(norm_type),
         )
         self._apply_trainable_scope()
 
@@ -344,9 +339,14 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         return policy_config
 
     def _selected_trainable_scope(self):
-        sft_trainable_scope = getattr(
-            self.config, "sft_trainable_scope", DEFAULT_SFT_TRAINABLE_SCOPE
-        )
+        sft_trainable_scope = getattr(self.config, "sft_trainable_scope", None)
+        rl_trainable_scope = getattr(self.config, "rl_trainable_scope", None)
+        if sft_trainable_scope is not None and rl_trainable_scope is not None:
+            raise ValueError(
+                "LingbotVLA config cannot set both sft_trainable_scope and "
+                "rl_trainable_scope. Use the SFT key for SFT and the RL key "
+                "for GRPO/PPO."
+            )
         if sft_trainable_scope is not None:
             return sft_trainable_scope, "sft_trainable_scope"
         return (
@@ -449,39 +449,13 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         return torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).contiguous()
 
     def _reorder_env_state_to_robotwin_rep(self, state: torch.Tensor) -> torch.Tensor:
-        if state.shape[-1] <= max(ROBOTWIN_ENV_TO_REP_STATE_INDICES):
-            raise ValueError(
-                "LingbotVLA RoboTwin SFT expects at least 14 state dims before "
-                f"robotwin_rep reorder, got {state.shape[-1]}."
-            )
-        indices = torch.as_tensor(
-            ROBOTWIN_ENV_TO_REP_STATE_INDICES, device=state.device, dtype=torch.long
-        )
-        return state.index_select(-1, indices)
+        return robotwin_env_state_to_rep(state)
 
     def _reorder_rep_state_for_model(self, state: torch.Tensor) -> torch.Tensor:
-        if state.shape[-1] <= max(ROBOTWIN_REP_PADDED_STATE_INDICES):
-            raise ValueError(
-                "LingbotVLA RoboTwin SFT expects padded state with at least 75 dims, "
-                f"got {state.shape[-1]}."
-            )
-        indices = torch.as_tensor(
-            ROBOTWIN_REP_PADDED_STATE_INDICES, device=state.device, dtype=torch.long
-        )
-        return state.index_select(-1, indices)
+        return robotwin_rep_state_to_model(state)
 
     def _select_env_action_dims(self, action_tensor: torch.Tensor) -> torch.Tensor:
-        if action_tensor.shape[-1] <= max(ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES):
-            raise ValueError(
-                "LingbotVLA RoboTwin SFT expects action tensor with at least 16 dims "
-                f"before env action reorder, got {action_tensor.shape[-1]}."
-            )
-        indices = torch.as_tensor(
-            ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES,
-            device=action_tensor.device,
-            dtype=torch.long,
-        )
-        return action_tensor.index_select(-1, indices)[..., : self.action_env_dim]
+        return robotwin_model_action_to_env(action_tensor, self.action_env_dim)
 
     def gradient_checkpointing_enable(self, **kwargs):
         if hasattr(self.vla_model, "gradient_checkpointing_enable"):
@@ -1119,7 +1093,7 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         policy_config.action_dim = self.sft_action_loss_dim
         model_config.action_dim = self.sft_action_loss_dim
         try:
-            total_loss, loss_vla, loss_depth, loss_dict, depth_preds = self.vla_model(
+            total_loss, loss_vla, _, loss_dict, _ = self.vla_model(
                 images=images,
                 img_masks=data["img_masks"],
                 state=state,

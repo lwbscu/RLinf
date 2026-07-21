@@ -33,6 +33,6 @@ lingbotvla:
   
   # Interpolation pointers to global actor settings (Hydra magic)
   action_chunk: ${..num_action_chunks}
-  action_env_dim: ${..action_dim}
+  action_env_dim: ${..action_env_dim}
   num_steps: ${..num_steps}
   add_value_head: ${..add_value_head}

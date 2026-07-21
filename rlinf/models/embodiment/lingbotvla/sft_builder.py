@@ -21,6 +21,13 @@ from lerobot.configs.policies import PreTrainedConfig
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
+from rlinf.models.embodiment.lingbotvla.robotwin_rep import (
+    robotwin_env_action_to_model,
+    robotwin_env_state_to_rep,
+    robotwin_normalizer_types,
+    robotwin_rep_state_to_model,
+)
+
 
 def _import_lingbotvla_deps():
     try:
@@ -48,42 +55,6 @@ def _import_lingbotvla_deps():
         prepare_language,
         prepare_state,
     )
-
-
-ROBOTWIN_ENV_TO_REP_STATE_INDICES = list(range(6)) + list(range(7, 13)) + [6] + [13]
-ROBOTWIN_REP_PADDED_STATE_INDICES = (
-    list(range(12)) + list(range(73, 75)) + list(range(12, 14)) + list(range(14, 73))
-)
-
-
-def _select_last_dim(tensor, indices, name):
-    if tensor.shape[-1] <= max(indices):
-        raise ValueError(
-            f"LingbotVLA RobotWin SFT expects {name} to have at least "
-            f"{max(indices) + 1} dims, got {tensor.shape[-1]}."
-        )
-    index = torch.as_tensor(indices, device=tensor.device, dtype=torch.long)
-    return tensor.index_select(-1, index)
-
-
-def _robotwin_rep_action_for_model(action, max_action_dim):
-    if action.shape[-1] < 14:
-        raise ValueError(
-            "LingbotVLA RobotWin SFT expects normalized env action with at least "
-            f"14 dims, got {action.shape[-1]}."
-        )
-    if max_action_dim < 16:
-        raise ValueError(
-            "LingbotVLA RobotWin SFT requires max_action_dim >= 16 for "
-            f"robotwin_rep gripper targets, got {max_action_dim}."
-        )
-
-    model_action = action.new_zeros((*action.shape[:-1], max_action_dim))
-    model_action[..., :6] = action[..., :6]
-    model_action[..., 6:12] = action[..., 7:13]
-    model_action[..., 14] = action[..., 6]
-    model_action[..., 15] = action[..., 13]
-    return model_action
 
 
 @dataclass
@@ -127,13 +98,7 @@ def _build_robotwin_dataset_cls(
                 norm_stats=self.norm_stats["norm_stats"],
                 from_file=True,
                 data_type=data_type,
-                norm_type={
-                    "observation.images.cam_high": "identity",
-                    "observation.images.cam_left_wrist": "identity",
-                    "observation.images.cam_right_wrist": "identity",
-                    "observation.state": data_config.norm_type,
-                    "action": data_config.norm_type,
-                },
+                norm_type=robotwin_normalizer_types(data_config.norm_type),
             )
 
         def getdata(self, idx):
@@ -144,10 +109,8 @@ def _build_robotwin_dataset_cls(
             task = self.dataset_meta.tasks[int(item["task_index"])]
             assert task == item["task"]
 
-            item["observation.state"] = _select_last_dim(
-                item["observation.state"],
-                ROBOTWIN_ENV_TO_REP_STATE_INDICES,
-                "raw env state before robotwin_rep reorder",
+            item["observation.state"] = robotwin_env_state_to_rep(
+                item["observation.state"]
             )
             normalized_item = self.normalizer.normalize(item)
 
@@ -174,15 +137,11 @@ def _build_robotwin_dataset_cls(
             }
 
             state = prepare_state(self.config, batch_dict)
-            state = _select_last_dim(
-                state,
-                ROBOTWIN_REP_PADDED_STATE_INDICES,
-                "padded robotwin_rep state before model reorder",
-            )
+            state = robotwin_rep_state_to_model(state)
             lang_tokens, lang_masks = prepare_language(
                 self.config, self.tokenizer, batch_dict
             )
-            actions = _robotwin_rep_action_for_model(
+            actions = robotwin_env_action_to_model(
                 batch_dict["action"], int(self.config.max_action_dim)
             )
             images, img_masks, pil_images = prepare_images(

@@ -12,11 +12,9 @@ RL on Lingbot-VLA Models
 
    Lingbot-VLA on RoboTwin (image: `RLinf <https://github.com/RLinf>`__).
 
-`Lingbot-VLA <https://huggingface.co/robbyant/lingbot-vla-4b>`__ is a Qwen2.5-VL-based
-vision-language-action model that autoregressively generates continuous action chunks.
-RLinf integrates it **natively** — embedded in RLinf's Python memory space for
-zero-latency, tensor-level interaction — and supports full-parameter SFT and GRPO
-fine-tuning on the RoboTwin 2.0 simulator.
+`Lingbot-VLA <https://huggingface.co/robbyant/lingbot-vla-4b>`__ is based on Qwen2.5-VL
+and generates continuous action chunks. RLinf integrates it through in-process Tensor
+interaction and supports full-parameter SFT and GRPO on RoboTwin 2.0.
 
 Overview
 --------
@@ -65,11 +63,11 @@ Select the model page by matching the environment, task family, and config or ch
    * - RoboTwin
      - Click Bell
      - ``robotwin_click_bell_grpo_lingbotvla``
-     - GRPO training with LingbotVLA on a RoboTwin manipulation task.
+     - Extend LingbotVLA with GRPO on a RoboTwin manipulation task.
    * - RoboTwin
      - Place Shoe
      - ``robotwin_place_shoe_grpo_lingbotvla``
-     - GRPO training on a second RoboTwin task variant.
+     - Extend LingbotVLA with GRPO on a RoboTwin manipulation task.
 
 Observation and Action
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -92,7 +90,8 @@ Observation and Action
 Installation
 ------------
 
-To ensure perfect compatibility between the high-version Torch (2.8.0) and RLinf (Python 3.10), we have encapsulated the complex dependency isolation logic into an installation script. Please follow the steps below to build a hybrid environment.
+The installation script provides compatibility configuration for RLinf's Python 3.10,
+Torch 2.8.0, and the Lingbot-VLA/RoboTwin dependencies. Follow the steps below to install them.
 
 1. Clone the RLinf Repository
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -129,7 +128,8 @@ Please switch to the corresponding virtual environment via the built-in `switch_
 
 **Option 2: Custom Environment**
 
-Install the Lingbot-VLA native environment and RoboTwin base dependencies in one command (the script will automatically pull the lingbot-vla source code to the `.venv/lingbot-vla` directory and handle all high-risk dependency conflicts):
+The installation script installs the Lingbot-VLA and RoboTwin dependencies and pulls
+the Lingbot-VLA source code into ``.venv/lingbot-vla``:
 
 .. code-block:: bash
 
@@ -145,9 +145,11 @@ RoboTwin Assets are asset files required by the RoboTwin environment and need to
 
    # 1. Clone RoboTwin repository
    git clone https://github.com/RoboTwin-Platform/RoboTwin.git -b RLinf_support
+   cd RoboTwin
 
    # 2. Download and extract Assets files
    bash script/_download_assets.sh
+   cd ..
 
 Download the Model
 ------------------
@@ -210,7 +212,7 @@ The core of the SFT phase lies in specifying the offline dataset path (LeRobot P
       global_batch_size: 8
       model:
         model_type: "lingbotvla"
-        model_path: "path/to/lingbot_model"
+        model_path: "path/to/lingbot-vla-4b"
         tokenizer_path: "/path/to/model/Qwen2.5-VL-3B-Instruct"
         precision: bf16
         num_action_chunks: 50
@@ -221,7 +223,12 @@ Key Config Snippets (GRPO)
 
 The top-level file dynamically assembles the environment and model via Hydra, and directly overrides the core SDE sampling parameters required for GRPO reinforcement learning under ``actor.model``.
 
-**Note**: Because Lingbot-VLA uses the unified global normalization keys (e.g., ``action.arm.position``) from ``robotwin_50.json``, there is **no need to configure or override** ``unnorm_key`` when switching between different tasks, enabling truly smooth multi-task transfer.
+**Note**: The current default Lingbot-VLA RoboTwin configuration loads
+``robotwin_all_new.json`` through ``actor.model.lingbotvla.stats_path`` and handles
+state and action normalization and unnormalization using the ``robotwin_rep``
+representation. Lingbot-VLA does not use a task-specific ``unnorm_key``; therefore,
+when switching among supported tasks that use the same ``robotwin_rep`` representation
+and statistics file, there is usually no need to configure or override ``unnorm_key``.
 
 .. code-block:: yaml
 

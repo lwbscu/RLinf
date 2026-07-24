@@ -40,6 +40,13 @@ from torch.utils._pytree import tree_map
 from transformers import AutoConfig
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.lingbotvla.robotwin_rep import (
+    ROBOTWIN_MODEL_ACTION_TO_ENV_INDICES,
+    robotwin_env_state_to_rep,
+    robotwin_model_action_to_env,
+    robotwin_normalizer_types,
+    robotwin_rep_state_to_model,
+)
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.logging import get_logger
@@ -63,11 +70,6 @@ class Observation:
         )
 
 
-ROBOTWIN_ENV_TO_REP_STATE_INDICES = list(range(6)) + list(range(7, 13)) + [6] + [13]
-ROBOTWIN_REP_PADDED_STATE_INDICES = (
-    list(range(12)) + list(range(73, 75)) + list(range(12, 14)) + list(range(14, 73))
-)
-ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES = list(range(6)) + [14] + list(range(6, 12)) + [15]
 DEFAULT_RL_TRAINABLE_SCOPE = "action_expert"
 PIL_BILINEAR = (
     Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
@@ -103,10 +105,8 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
             "depth_align_embs",
             "value_head",
         ]
-        if (
-            getattr(self.config, "rl_trainable_scope", DEFAULT_RL_TRAINABLE_SCOPE)
-            == "action_expert"
-        ):
+        trainable_scope, _ = self._selected_trainable_scope()
+        if trainable_scope == "action_expert":
             no_split_names.extend(
                 [
                     "action_time_mlp_in",
@@ -178,11 +178,17 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
                 ),
             )
         )
-        self.action_env_dim = int(getattr(config, "action_env_dim", self.action_dim))
-        if not 0 < self.action_env_dim <= len(ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES):
+        self.action_env_dim = int(
+            getattr(
+                config,
+                "action_env_dim",
+                getattr(lingbotvla_cfg, "action_env_dim", self.action_dim),
+            )
+        )
+        if not 0 < self.action_env_dim <= len(ROBOTWIN_MODEL_ACTION_TO_ENV_INDICES):
             raise ValueError(
                 "LingbotVLA action_env_dim must be in the range "
-                f"[1, {len(ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES)}] for RoboTwin "
+                f"[1, {len(ROBOTWIN_MODEL_ACTION_TO_ENV_INDICES)}] for RoboTwin "
                 f"SFT action reorder, got {self.action_env_dim}."
             )
         self.num_steps = int(getattr(config, "num_steps", 10))
@@ -193,6 +199,14 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         qwen_config.n_action_steps = self.action_chunk
         qwen_config.max_action_dim = int(getattr(qwen_config, "max_action_dim", 75))
         qwen_config.max_state_dim = int(getattr(qwen_config, "max_state_dim", 75))
+        self.sft_action_loss_dim = int(
+            getattr(config, "sft_action_loss_dim", self.action_dim)
+        )
+        if not 0 < self.sft_action_loss_dim <= qwen_config.max_action_dim:
+            raise ValueError(
+                "LingbotVLA sft_action_loss_dim must be in the range "
+                f"[1, {qwen_config.max_action_dim}], got {self.sft_action_loss_dim}."
+            )
 
         self.vla_model = LingbotVlaPolicy(
             config=qwen_config, tokenizer_path=config.tokenizer_path, eval=True
@@ -268,15 +282,9 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
             norm_stats=self.norm_stats,
             from_file=True,
             data_type="robotwin_rep",
-            norm_type={
-                "observation.images.cam_high": "identity",
-                "observation.images.cam_left_wrist": "identity",
-                "observation.images.cam_right_wrist": "identity",
-                "observation.state": norm_type,
-                "action": norm_type,
-            },
+            norm_type=robotwin_normalizer_types(norm_type),
         )
-        self._apply_rl_trainable_scope()
+        self._apply_trainable_scope()
 
     def _load_training_config(self, config_path: str, model_path: Optional[str]):
         candidate_paths = [os.path.join(config_path, "lingbotvla_cli.yaml")]
@@ -330,11 +338,25 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         policy_config.vision_config = qwen_config.vision_config
         return policy_config
 
+    def _selected_trainable_scope(self):
+        sft_trainable_scope = getattr(self.config, "sft_trainable_scope", None)
+        rl_trainable_scope = getattr(self.config, "rl_trainable_scope", None)
+        if sft_trainable_scope is not None and rl_trainable_scope is not None:
+            raise ValueError(
+                "LingbotVLA config cannot set both sft_trainable_scope and "
+                "rl_trainable_scope. Use the SFT key for SFT and the RL key "
+                "for GRPO/PPO."
+            )
+        if sft_trainable_scope is not None:
+            return sft_trainable_scope, "sft_trainable_scope"
+        return (
+            getattr(self.config, "rl_trainable_scope", DEFAULT_RL_TRAINABLE_SCOPE),
+            "rl_trainable_scope",
+        )
+
     def _mark_action_expert_fsdp_wrap_names(self):
-        if (
-            getattr(self.config, "rl_trainable_scope", DEFAULT_RL_TRAINABLE_SCOPE)
-            != "action_expert"
-        ):
+        trainable_scope, _ = self._selected_trainable_scope()
+        if trainable_scope != "action_expert":
             return
         qwen_expert_norm = getattr(
             self.vla_model.model.qwenvl_with_expert.qwen_expert.model,
@@ -344,17 +366,15 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         if qwen_expert_norm is not None:
             qwen_expert_norm._fsdp_wrap_name = "qwen_expert_norm"
 
-    def _apply_rl_trainable_scope(self):
-        trainable_scope = getattr(
-            self.config, "rl_trainable_scope", DEFAULT_RL_TRAINABLE_SCOPE
-        )
+    def _apply_trainable_scope(self):
+        trainable_scope, scope_name = self._selected_trainable_scope()
         if trainable_scope in (None, "all"):
-            self._log_trainable_scope("all")
+            self._log_trainable_scope(scope_name, "all")
             return
 
         if trainable_scope != "action_expert":
             raise ValueError(
-                "Unsupported LingbotVLA rl_trainable_scope: "
+                f"Unsupported LingbotVLA {scope_name}: "
                 f"{trainable_scope}. Expected one of: all, action_expert."
             )
 
@@ -379,15 +399,16 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
             for param in self.noise_head.parameters():
                 param.requires_grad = True
 
-        self._log_trainable_scope(trainable_scope)
+        self._log_trainable_scope(scope_name, trainable_scope)
 
-    def _log_trainable_scope(self, trainable_scope: str):
+    def _log_trainable_scope(self, scope_name: str, trainable_scope: str):
         trainable_params = sum(
             param.numel() for param in self.parameters() if param.requires_grad
         )
         total_params = sum(param.numel() for param in self.parameters())
         self.logger.info(
-            "LingbotVLA rl_trainable_scope=%s trainable_params=%d total_params=%d",
+            "LingbotVLA %s=%s trainable_params=%d total_params=%d",
+            scope_name,
             trainable_scope,
             trainable_params,
             total_params,
@@ -428,39 +449,13 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         return torch.from_numpy(np.array(pil_img)).permute(2, 0, 1).contiguous()
 
     def _reorder_env_state_to_robotwin_rep(self, state: torch.Tensor) -> torch.Tensor:
-        if state.shape[-1] <= max(ROBOTWIN_ENV_TO_REP_STATE_INDICES):
-            raise ValueError(
-                "LingbotVLA RoboTwin SFT expects at least 14 state dims before "
-                f"robotwin_rep reorder, got {state.shape[-1]}."
-            )
-        indices = torch.as_tensor(
-            ROBOTWIN_ENV_TO_REP_STATE_INDICES, device=state.device, dtype=torch.long
-        )
-        return state.index_select(-1, indices)
+        return robotwin_env_state_to_rep(state)
 
     def _reorder_rep_state_for_model(self, state: torch.Tensor) -> torch.Tensor:
-        if state.shape[-1] <= max(ROBOTWIN_REP_PADDED_STATE_INDICES):
-            raise ValueError(
-                "LingbotVLA RoboTwin SFT expects padded state with at least 75 dims, "
-                f"got {state.shape[-1]}."
-            )
-        indices = torch.as_tensor(
-            ROBOTWIN_REP_PADDED_STATE_INDICES, device=state.device, dtype=torch.long
-        )
-        return state.index_select(-1, indices)
+        return robotwin_rep_state_to_model(state)
 
     def _select_env_action_dims(self, action_tensor: torch.Tensor) -> torch.Tensor:
-        if action_tensor.shape[-1] <= max(ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES):
-            raise ValueError(
-                "LingbotVLA RoboTwin SFT expects action tensor with at least 16 dims "
-                f"before env action reorder, got {action_tensor.shape[-1]}."
-            )
-        indices = torch.as_tensor(
-            ROBOTWIN_MODEL_TO_ENV_ACTION_INDICES,
-            device=action_tensor.device,
-            dtype=torch.long,
-        )
-        return action_tensor.index_select(-1, indices)[..., : self.action_env_dim]
+        return robotwin_model_action_to_env(action_tensor, self.action_env_dim)
 
     def gradient_checkpointing_enable(self, **kwargs):
         if hasattr(self.vla_model, "gradient_checkpointing_enable"):
@@ -1090,16 +1085,29 @@ class LingbotvlaActionModel(nn.Module, BasePolicy):
         state = data["state"].to(dtype)
         actions = data["actions"].to(dtype)
 
-        total_loss, loss_vla, loss_depth, loss_dict, depth_preds = self.vla_model(
-            images=images,
-            img_masks=data["img_masks"],
-            state=state,
-            lang_tokens=data["lang_tokens"],
-            lang_masks=data["lang_masks"],
-            actions=actions,
-            use_ki=False,
-            norm_qkv=self.vla_model.model.config.norm_qkv,
-        )
+        policy_config = self.vla_model.config
+        model_config = self.vla_model.model.config
+        original_policy_action_dim = getattr(policy_config, "action_dim", None)
+        original_model_action_dim = getattr(model_config, "action_dim", None)
+
+        policy_config.action_dim = self.sft_action_loss_dim
+        model_config.action_dim = self.sft_action_loss_dim
+        try:
+            total_loss, loss_vla, _, loss_dict, _ = self.vla_model(
+                images=images,
+                img_masks=data["img_masks"],
+                state=state,
+                lang_tokens=data["lang_tokens"],
+                lang_masks=data["lang_masks"],
+                actions=actions,
+                use_ki=False,
+                norm_qkv=self.vla_model.model.config.norm_qkv,
+            )
+        finally:
+            if original_policy_action_dim is not None:
+                policy_config.action_dim = original_policy_action_dim
+            if original_model_action_dim is not None:
+                model_config.action_dim = original_model_action_dim
         return {"loss": total_loss, "l1_loss": loss_vla, **loss_dict}
 
     def default_forward(

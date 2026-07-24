@@ -12,9 +12,9 @@ Lingbot-VLA模型强化学习
 
    Lingbot-VLA 在 RoboTwin 上（图片来源：`RLinf <https://github.com/RLinf>`__）。
 
-`Lingbot-VLA <https://huggingface.co/robbyant/lingbot-vla-4b>`__ 是一个基于 Qwen2.5-VL 的
-视觉-语言-动作模型，以自回归方式生成连续动作块。RLinf 将其原生接入——嵌入 RLinf 的 Python
-内存空间，实现零延迟的 Tensor 级交互——并支持在 RoboTwin 2.0 仿真器上进行全参数 SFT 与 GRPO 微调。
+`Lingbot-VLA <https://huggingface.co/robbyant/lingbot-vla-4b>`__ 基于 Qwen2.5-VL
+生成连续动作块。RLinf 通过进程内 Tensor 交互接入，并支持在 RoboTwin 2.0 上进行全参数 SFT
+与 GRPO。
 
 概览
 ----------------------------------------
@@ -63,11 +63,11 @@ Lingbot-VLA模型强化学习
    * - RoboTwin
      - Click Bell
      - ``robotwin_click_bell_grpo_lingbotvla``
-     - 在 RoboTwin 操作任务上使用 LingbotVLA 运行 GRPO。
+     - 在 RoboTwin 操作任务上给 LingbotVLA 拓展 GRPO。
    * - RoboTwin
      - Place Shoe
      - ``robotwin_place_shoe_grpo_lingbotvla``
-     - 在第二个 RoboTwin 任务变体上运行 GRPO。
+     - 在 RoboTwin 操作任务上给 LingbotVLA 拓展 GRPO。
 
 观测与动作
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -90,7 +90,7 @@ Lingbot-VLA模型强化学习
 安装
 ----------------------------------------
 
-为了实现高版本 Torch (2.8.0) 与 RLinf (Python 3.10) 的完美兼容，我们已将复杂的依赖隔离逻辑封装至安装脚本中。请按以下步骤构建混合环境。
+安装脚本为 RLinf 的 Python 3.10、Torch 2.8.0 与 Lingbot-VLA/RoboTwin 依赖提供兼容性配置。请按以下步骤安装。
 
 1. 克隆 RLinf 仓库
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -127,7 +127,7 @@ Lingbot-VLA模型强化学习
 
 **选项 2：自定义环境**
 
-在本地环境中一键安装 Lingbot-VLA 原生环境与 RoboTwin 基础依赖（脚本将自动拉取 Lingbot-VLA 源码至 `.venv/lingbot-vla` 目录，并处理所有高危依赖冲突）：
+安装脚本会安装 Lingbot-VLA 与 RoboTwin 依赖，并将 Lingbot-VLA 源码拉取到 ``.venv/lingbot-vla``：
 
 .. code-block:: bash
 
@@ -143,9 +143,11 @@ RoboTwin Assets 是 RoboTwin 环境运行所需的资源文件，需要从 Huggi
 
    # 1. 克隆 RoboTwin 仓库
    git clone https://github.com/RoboTwin-Platform/RoboTwin.git -b RLinf_support
+   cd RoboTwin
 
    # 2. 下载并解压 Assets 文件
    bash script/_download_assets.sh
+   cd ..
 
 下载模型
 ----------------------------------------
@@ -208,7 +210,7 @@ SFT 阶段的核心在于指定离线数据集格式（LeRobot Parquet 格式）
       global_batch_size: 8
       model:
         model_type: "lingbotvla"
-        model_path: "path/to/lingbot_model"
+        model_path: "path/to/lingbot-vla-4b"
         tokenizer_path: "/path/to/model/Qwen2.5-VL-3B-Instruct"
         precision: bf16
         num_action_chunks: 50
@@ -219,7 +221,7 @@ SFT 阶段的核心在于指定离线数据集格式（LeRobot Parquet 格式）
 
 GRPO 顶层文件通过 Hydra 动态组装了环境与模型，并直接在 ``actor.model`` 下覆写了强化学习所需的核心 SDE 采样参数。
 
-**注意**：由于 Lingbot-VLA 使用的是 ``robotwin_50.json`` 中统一的全局归一化键值（如 ``action.arm.position``），因此在不同任务间切换时，**无需再配置或覆写** ``unnorm_key``，实现了真正的多任务平滑迁移。
+**注意**：当前 Lingbot-VLA RoboTwin 默认配置通过 ``actor.model.lingbotvla.stats_path`` 加载 ``robotwin_all_new.json``，并按 ``robotwin_rep`` 表征处理状态与动作的归一化和反归一化。Lingbot-VLA 不使用按任务选择的 ``unnorm_key``；因此，在采用相同 ``robotwin_rep`` 表征与统计文件的受支持任务间切换时，通常无需额外配置或覆写 ``unnorm_key``。
 
 .. code-block:: yaml
 

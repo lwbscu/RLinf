@@ -14,7 +14,6 @@
 
 import logging
 import os
-import subprocess
 from typing import TYPE_CHECKING, Optional, Union
 
 from omegaconf.dictconfig import DictConfig
@@ -30,11 +29,6 @@ if TYPE_CHECKING:
     from rlinf.workers.sft.fsdp_sft_worker import FSDPSftWorker
 
 logger = logging.getLogger(__name__)
-
-
-class _PostSaveEvalFormatDict(dict):
-    def __missing__(self, key):
-        return "{" + key + "}"
 
 
 class SFTRunner:
@@ -109,8 +103,7 @@ class SFTRunner:
                 )
 
                 if save_model:
-                    checkpoint_dir = self._save_checkpoint()
-                    self._run_post_save_eval(checkpoint_dir)
+                    self._save_checkpoint()
 
                 should_stop = False
                 if eval_model:
@@ -183,7 +176,7 @@ class SFTRunner:
         logger.info(f"Eval metrics: {evaluate_metrics}")
         self.metric_logger.finish()
 
-    def _save_checkpoint(self, is_best: bool = False) -> str:
+    def _save_checkpoint(self, is_best: bool = False) -> None:
         checkpoint_root = os.path.join(
             self.cfg.runner.logger.log_path,
             self.cfg.runner.logger.experiment_name,
@@ -202,95 +195,6 @@ class SFTRunner:
             logger.info(
                 f"Saved best model (val_acc={self.early_stop.best_val_acc:.4f}) to {base_output_dir}"
             )
-        return base_output_dir
-
-    def _run_post_save_eval(self, checkpoint_dir: str) -> None:
-        eval_cfg = self.cfg.runner.get("post_save_eval", None)
-        if eval_cfg is None or not bool(eval_cfg.get("enabled", False)):
-            return
-
-        command_template = eval_cfg.get("command", None)
-        if not command_template:
-            raise ValueError(
-                "runner.post_save_eval.enabled=True requires "
-                "runner.post_save_eval.command to be set."
-            )
-
-        actor_dir = os.path.join(checkpoint_dir, "actor")
-        full_weights_path = os.path.join(
-            actor_dir, "model_state_dict", "full_weights.pt"
-        )
-        if "{full_weights_path}" in command_template and not os.path.exists(
-            full_weights_path
-        ):
-            raise FileNotFoundError(
-                "runner.post_save_eval.command references {full_weights_path}, "
-                f"but the file does not exist: {full_weights_path}"
-            )
-
-        eval_log_dir = eval_cfg.get("eval_log_dir", None)
-        if not eval_log_dir:
-            eval_log_dir = os.path.join(
-                self.cfg.runner.logger.log_path,
-                self.cfg.runner.logger.experiment_name,
-                "eval",
-                f"global_step_{self.global_step}",
-            )
-        os.makedirs(eval_log_dir, exist_ok=True)
-
-        format_values = _PostSaveEvalFormatDict(
-            checkpoint_dir=checkpoint_dir,
-            actor_dir=actor_dir,
-            full_weights_path=full_weights_path,
-            global_step=self.global_step,
-            eval_log_dir=eval_log_dir,
-        )
-        command = str(command_template).format_map(format_values)
-        logger.info(
-            "Running post-save eval for global_step_%s: %s",
-            self.global_step,
-            command,
-        )
-
-        offloaded = False
-        if bool(eval_cfg.get("offload_actor", False)):
-            self._call_actor_helper("offload_for_external_eval")
-            offloaded = True
-
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                cwd=eval_cfg.get("cwd", None),
-                check=False,
-            )
-            self.metric_logger.log(
-                {"post_save_eval/returncode": float(result.returncode)},
-                self.global_step,
-            )
-            if result.returncode != 0:
-                message = (
-                    "post-save eval command failed with return code "
-                    f"{result.returncode}: {command}"
-                )
-                if bool(eval_cfg.get("fail_on_error", True)):
-                    raise RuntimeError(message)
-                logger.warning(message)
-        finally:
-            if offloaded:
-                self._call_actor_helper("load_after_external_eval")
-
-    def _call_actor_helper(self, helper_name: str) -> None:
-        try:
-            helper = getattr(self.actor, helper_name)
-        except AttributeError as exc:
-            raise AttributeError(
-                f"Actor worker does not support {helper_name}()."
-            ) from exc
-
-        handle = helper()
-        if hasattr(handle, "wait"):
-            handle.wait()
 
     def set_max_steps(self) -> None:
         self.num_steps_per_epoch = self.actor.get_max_steps_per_epoch().wait()[0]

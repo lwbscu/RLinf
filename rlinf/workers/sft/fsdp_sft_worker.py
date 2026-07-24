@@ -99,20 +99,6 @@ class FSDPSftWorker(FSDPModelManager, Worker):
         if hasattr(self.model, "set_global_step"):
             self.model.set_global_step(global_step)
 
-    def offload_for_external_eval(self):
-        if not self.is_weight_offloaded:
-            self.offload_param_and_grad()
-        if not self.is_optimizer_offloaded:
-            self.offload_optimizer()
-        clear_memory()
-
-    def load_after_external_eval(self):
-        if self.is_weight_offloaded:
-            self.load_param_and_grad(self.device)
-        if self.is_optimizer_offloaded:
-            self.load_optimizer(self.device)
-        clear_memory()
-
     def get_max_steps_per_epoch(self):
         if self.data_loader is not None:
             return max(1, len(self.data_loader) // self.gradient_accumulation)

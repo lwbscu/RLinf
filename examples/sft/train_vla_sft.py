@@ -29,7 +29,7 @@ mp.set_start_method("spawn", force=True)
 
 
 @hydra.main(
-    version_base="1.1", config_path="config", config_name="robotwin_sft_lingbotvla"
+    version_base="1.1", config_path="config", config_name="maniskill_ppo_openvlaoft"
 )
 def main(cfg) -> None:
     cfg = validate_cfg(cfg)
